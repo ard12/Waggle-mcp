@@ -486,6 +486,8 @@ def _build_backend(config: AppConfig) -> Any:
             tiered_retrieval_top_k_windows=config.tiered_retrieval_top_k_windows,
             hybrid_retrieval_config=config.hybrid_retrieval_config(),
             export_dir=config.export_dir,
+            hnsw_enabled=config.hnsw_enabled,
+            hnsw_dtype=config.hnsw_dtype,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
 
