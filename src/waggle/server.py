@@ -488,6 +488,11 @@ def _build_backend(config: AppConfig) -> Any:
             export_dir=config.export_dir,
             hnsw_enabled=config.hnsw_enabled,
             hnsw_dtype=config.hnsw_dtype,
+            paging_enabled=config.paging_enabled,
+            page_size=config.page_size,
+            paging_rebuild_threshold=config.paging_rebuild_threshold,
+            emb_cache_enabled=config.emb_cache_enabled,
+            emb_cache_dtype=config.emb_cache_dtype,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
 

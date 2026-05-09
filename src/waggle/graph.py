@@ -138,6 +138,7 @@ from waggle.models import (
 )
 from waggle.retrieval.hybrid import HybridRetrievalConfig, HybridRetriever
 from waggle.locks import ProcessLock
+from waggle.page_manager import GraphPageManager
 SCHEMA_VERSION = 7
 
 LOGGER = logging.getLogger(__name__)
@@ -702,6 +703,9 @@ class MemoryGraph:
         export_dir: str | Path | None = None,
         hnsw_enabled: bool = False,
         hnsw_dtype: str = "float32",
+        paging_enabled: bool = False,
+        page_size: int = 128,
+        paging_rebuild_threshold: int = 500,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.embedding_model = embedding_model
@@ -721,14 +725,12 @@ class MemoryGraph:
         self._initialize_database()
 
         # --- HNSW sidecar index ---
-        # Constructed unconditionally so the object is always present;
-        # HNSWIndex.is_available is False when hnswlib is not installed.
         hnsw_path = self.db_path.with_suffix(".hnsw")
         self._hnsw: HNSWIndex = HNSWIndex(
             hnsw_path,
-            dim=self.embedding_model._embed_deterministically("probe").shape[0]  # warm dim probe  # noqa: SLF001
+            dim=self.embedding_model._embed_deterministically("probe").shape[0]  # noqa: SLF001
             if self.embedding_model.uses_deterministic_mode
-            else 384,  # default; overridden on first add()
+            else 384,
             dtype=hnsw_dtype,
         )
         self._hnsw_enabled: bool = hnsw_enabled and HNSWLIB_AVAILABLE
@@ -736,6 +738,20 @@ class MemoryGraph:
             LOGGER.info("hnsw_rebuild_triggered", extra={"db": str(self.db_path)})
             with self._lock, self._connect() as connection:
                 self._hnsw.rebuild_from_db(connection, self.tenant_id, self.embedding_model)
+
+        # --- Spatial graph paging (MemPalace-inspired locality clustering) ---
+        self._paging_enabled: bool = paging_enabled
+        self._page_manager: GraphPageManager = GraphPageManager(
+            self.db_path.parent / "waggle.pages.json",
+            page_size=page_size,
+            rebuild_threshold=paging_rebuild_threshold,
+        )
+        if self._paging_enabled:
+            loaded = self._page_manager.load()
+            if not loaded:
+                LOGGER.info("paging_rebuild_triggered", extra={"db": str(self.db_path)})
+                with self._lock, self._connect() as connection:
+                    self._page_manager.rebuild_from_db(connection, self.tenant_id, self.embedding_model)
 
     def hybrid_retriever(self) -> HybridRetriever:
         return HybridRetriever(self, config=self.hybrid_retrieval_config)
@@ -2542,6 +2558,11 @@ class MemoryGraph:
             # Keep HNSW index in sync with every SQLite write.
             if self._hnsw_enabled:
                 self._hnsw.add(node.id, embedding_vector)
+            # Incrementally assign the new node to the nearest page.
+            if self._paging_enabled and self._page_manager.is_built:
+                self._page_manager.assign_new_node(node.id, embedding_vector, node.project)
+                if self._page_manager.rebuild_needed(len(self._page_manager._node_page) + self._page_manager._orphan_count):  # noqa: SLF001
+                    LOGGER.info("paging_rebuild_threshold_reached", extra={"orphans": self._page_manager._orphan_count})  # noqa: SLF001
             return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
         if connection is not None:
@@ -3060,6 +3081,13 @@ class MemoryGraph:
                 expanded_query = self._expand_query_aliases(query)
                 query_embedding = self.embedding_model.embed(expanded_query)
 
+                # Page-centroid scoring: score P page centroids (P << N).
+                page_scores = (
+                    self._page_manager.score_pages(query_embedding)
+                    if self._paging_enabled and self._page_manager.is_built
+                    else {}
+                )
+
                 # Batch vectorized similarity: one BLAS matmul instead of N Python calls.
                 node_ids_with_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is not None]
                 node_ids_no_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is None]
@@ -3068,10 +3096,16 @@ class MemoryGraph:
                 if node_ids_with_emb:
                     emb_matrix = np.stack([embeddings_by_id[nid] for nid in node_ids_with_emb])
                     scores = self.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)
-                    scored_candidates = [(float(s), nodes_by_id_map[nid]) for nid, s in zip(node_ids_with_emb, scores)]
+                    scored_candidates = [
+                        (
+                            float(s) + self._page_manager.get_page_boost(nid, page_scores),
+                            nodes_by_id_map[nid],
+                        )
+                        for nid, s in zip(node_ids_with_emb, scores)
+                    ]
                 else:
                     scored_candidates = []
-                # Nodes without embeddings score 0
+                # Nodes without embeddings score 0 (no boost either)
                 scored_candidates.extend((0.0, nodes_by_id_map[nid]) for nid in node_ids_no_emb)
 
                 scored_candidates.sort(key=lambda item: item[0], reverse=True)

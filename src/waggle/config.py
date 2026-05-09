@@ -55,12 +55,17 @@ class AppConfig:
     # are merged at write time instead of creating a duplicate.
     # Must be >= 0.85 to avoid false-positive merges.
     dedup_threshold: float = 0.88
-    # HNSW approximate nearest-neighbour index.
+    # HNSW approximate nearest-neighbour index (PR 2).
     # Requires: pip install waggle-mcp[perf]  (hnswlib >= 0.8.0)
-    # When enabled, aggregate() uses O(log N) ANN search instead of O(N) scan.
     hnsw_enabled: bool = False
-    # float32 (default) or float16 (halves memory, negligible recall loss)
     hnsw_dtype: str = "float32"
+    # Spatial graph paging — MemPalace-inspired locality clustering (PR 3).
+    paging_enabled: bool = False
+    page_size: int = 128
+    paging_rebuild_threshold: int = 500
+    # Shared mmap embedding cache — zero-copy cross-process reads (PR 4).
+    emb_cache_enabled: bool = False
+    emb_cache_dtype: str = "float32"
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -104,6 +109,11 @@ class AppConfig:
             dedup_threshold=float(os.environ.get("WAGGLE_DEDUP_THRESHOLD", "0.88")),
             hnsw_enabled=os.environ.get("WAGGLE_HNSW_ENABLED", "false").strip().lower() == "true",
             hnsw_dtype=os.environ.get("WAGGLE_HNSW_DTYPE", "float32").strip().lower(),
+            paging_enabled=os.environ.get("WAGGLE_PAGING_ENABLED", "false").strip().lower() == "true",
+            page_size=int(os.environ.get("WAGGLE_PAGE_SIZE", "128")),
+            paging_rebuild_threshold=int(os.environ.get("WAGGLE_PAGING_REBUILD_THRESHOLD", "500")),
+            emb_cache_enabled=os.environ.get("WAGGLE_EMB_CACHE_ENABLED", "false").strip().lower() == "true",
+            emb_cache_dtype=os.environ.get("WAGGLE_EMB_CACHE_DTYPE", "float32").strip().lower(),
         )
         config.validate()
         return config
