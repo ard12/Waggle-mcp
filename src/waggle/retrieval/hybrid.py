@@ -128,12 +128,10 @@ def _recency_decay(age_days: float, half_life_days: float) -> float:
     return math.exp(-age_days / half_life_days)
 
 
-def _cosine(a: np.ndarray, b: np.ndarray, embedding_model: Any) -> float:
-    return max(float(embedding_model.cosine_similarity(a, b)), 0.0)
-
 
 def _safe_float(value: float) -> float:
     return float(max(0.0, value))
+
 
 
 class SimpleBM25:
@@ -335,7 +333,10 @@ class HybridRetriever:
         for pair in turn_pairs:
             if not pair.embeddings:
                 continue
-            semantic = max(_cosine(query_embedding, embedding, self.graph.embedding_model) for embedding in pair.embeddings)  # noqa: SLF001
+            # Batch: stack all per-turn embeddings for this pair, compute sims in one matmul.
+            emb_matrix = np.stack([np.asarray(e, dtype=np.float32) for e in pair.embeddings])
+            sims = self.graph.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)  # noqa: SLF001
+            semantic = float(sims.max())
             ranked.append(
                 CandidateMemory(
                     candidate_id=f"tp:{pair.turn_pair_id}",
@@ -373,10 +374,19 @@ class HybridRetriever:
                 """,
                 tuple(params),
             ).fetchall()
+
+        if not rows:
+            return []
+
+        # Batch vectorized similarity: stack all embeddings and do one matmul.
+        emb_matrix = np.stack(
+            [self.graph.embedding_model.from_bytes(row["embedding"]) for row in rows]  # noqa: SLF001
+        )
+        scores = self.graph.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)  # noqa: SLF001
+
         ranked: list[CandidateMemory] = []
-        for row in rows:
+        for row, semantic in zip(rows, scores):
             node = self.graph._row_to_node(row)  # noqa: SLF001
-            semantic = _cosine(query_embedding, self.graph.embedding_model.from_bytes(row["embedding"]), self.graph.embedding_model)  # noqa: SLF001
             ranked.append(
                 CandidateMemory(
                     candidate_id=f"node:{node.id}",
@@ -385,7 +395,7 @@ class HybridRetriever:
                     turn_pair_id=node.source_turn_pair_id,
                     node_ids=[node.id],
                     observed_at=node.updated_at,
-                    layer_scores={"vector_node": semantic},
+                    layer_scores={"vector_node": float(semantic)},
                 )
             )
         ranked.sort(key=lambda item: item.layer_scores["vector_node"], reverse=True)

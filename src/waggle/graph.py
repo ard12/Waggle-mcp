@@ -3003,15 +3003,21 @@ class MemoryGraph:
             if query.strip():
                 expanded_query = self._expand_query_aliases(query)
                 query_embedding = self.embedding_model.embed(expanded_query)
-                
-                scored_candidates = []
-                for node in candidates:
-                    similarity = 0.0
-                    emb = embeddings_by_id.get(node.id)
-                    if emb is not None:
-                        similarity = max(self.embedding_model.cosine_similarity(query_embedding, emb), 0.0)
-                    scored_candidates.append((similarity, node))
-                
+
+                # Batch vectorized similarity: one BLAS matmul instead of N Python calls.
+                node_ids_with_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is not None]
+                node_ids_no_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is None]
+                nodes_by_id_map = {n.id: n for n in candidates}
+
+                if node_ids_with_emb:
+                    emb_matrix = np.stack([embeddings_by_id[nid] for nid in node_ids_with_emb])
+                    scores = self.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)
+                    scored_candidates = [(float(s), nodes_by_id_map[nid]) for nid, s in zip(node_ids_with_emb, scores)]
+                else:
+                    scored_candidates = []
+                # Nodes without embeddings score 0
+                scored_candidates.extend((0.0, nodes_by_id_map[nid]) for nid in node_ids_no_emb)
+
                 scored_candidates.sort(key=lambda item: item[0], reverse=True)
                 selected_nodes = [node for _, node in scored_candidates[:max_nodes]]
             else:
@@ -3451,10 +3457,15 @@ class MemoryGraph:
 
             expanded_query = self._expand_query_aliases(query)
             query_embedding = self.embedding_model.embed(expanded_query)
-            similarity_by_id = {
-                node_id: max(self.embedding_model.cosine_similarity(query_embedding, embedding), 0.0)
-                for node_id, embedding in embeddings_by_id.items()
-            }
+
+            # Batch vectorized similarity: one BLAS matmul instead of N Python calls.
+            if embeddings_by_id:
+                emb_node_ids = list(embeddings_by_id.keys())
+                emb_matrix = np.stack([embeddings_by_id[nid] for nid in emb_node_ids])
+                scores = self.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)
+                similarity_by_id = {nid: float(s) for nid, s in zip(emb_node_ids, scores)}
+            else:
+                similarity_by_id = {}
             replay_session_scores = self._query_replay_session_scores(
                 query=expanded_query,
                 query_embedding=query_embedding,
@@ -6740,22 +6751,37 @@ class MemoryGraph:
         total = len(rows)
         pairs: list[DedupCandidatePair] = []
 
+        if total == 0:
+            return DedupCandidatesResult(
+                pairs=pairs, threshold=threshold, total_nodes_scanned=total
+            )
+
+        # Build the full embedding matrix and compute all pairwise similarities
+        # in one BLAS call (M @ M.T) instead of an O(N²) Python loop.
+        node_ids = [rows[i]["id"] for i in range(total)]
+        node_types = [NodeType(rows[i]["node_type"]) for i in range(total)]
+        emb_matrix = np.stack(
+            [self.embedding_model.from_bytes(rows[i]["embedding"]) for i in range(total)]
+        )
+        sim_matrix = self.embedding_model.pairwise_cosine_matrix(emb_matrix)
+
         for i in range(total):
-            emb_i = self.embedding_model.from_bytes(rows[i]["embedding"])
-            type_i = NodeType(rows[i]["node_type"])
+            type_i = node_types[i]
+            auto_threshold_i = type_aware_dedup_threshold(type_i, default=self.dedup_similarity_threshold)
             for j in range(i + 1, total):
-                type_j = NodeType(rows[j]["node_type"])
+                type_j = node_types[j]
                 if not compatible_node_types(type_i, type_j):
                     continue
-                emb_j = self.embedding_model.from_bytes(rows[j]["embedding"])
-                sim = self.embedding_model.cosine_similarity(emb_i, emb_j)
-                # Report pairs above threshold but below the auto-merge threshold
-                auto_threshold = type_aware_dedup_threshold(type_i, default=self.dedup_similarity_threshold)
+                sim = float(sim_matrix[i, j])
+                auto_threshold = min(
+                    auto_threshold_i,
+                    type_aware_dedup_threshold(type_j, default=self.dedup_similarity_threshold),
+                )
                 if threshold <= sim < auto_threshold:
                     pairs.append(
                         DedupCandidatePair(
-                            node_id_a=rows[i]["id"],
-                            node_id_b=rows[j]["id"],
+                            node_id_a=node_ids[i],
+                            node_id_b=node_ids[j],
                             label_a=rows[i]["label"],
                             label_b=rows[j]["label"],
                             similarity=round(sim, 4),
