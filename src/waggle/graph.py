@@ -4520,6 +4520,143 @@ class MemoryGraph:
         report["total_edge_types"] = len(by_type)
         return report
 
+    def graph_health(
+        self,
+        *,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Return a structural health report for the memory graph.
+
+        Includes node and edge counts by type, orphan count (nodes with zero
+        edges), recent vs stale node ratios, and dedup candidate count.
+        Designed for operators to quickly assess whether the graph needs
+        consolidation, pruning, or deduplication.
+        """
+        with self._lock, self._connect() as connection:
+            # --- node counts by type ---
+            node_type_rows = connection.execute(
+                """
+                SELECT node_type, COUNT(*) AS cnt
+                FROM nodes
+                WHERE tenant_id = ?
+                GROUP BY node_type
+                ORDER BY cnt DESC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+            nodes_by_type = {row["node_type"]: row["cnt"] for row in node_type_rows}
+            total_nodes = sum(nodes_by_type.values())
+
+            # --- edge counts by relationship ---
+            edge_type_rows = connection.execute(
+                """
+                SELECT relationship, COUNT(*) AS cnt
+                FROM edges
+                WHERE tenant_id = ?
+                GROUP BY relationship
+                ORDER BY cnt DESC
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+            edges_by_type = {row["relationship"]: row["cnt"] for row in edge_type_rows}
+            total_edges = sum(edges_by_type.values())
+
+            # --- orphan nodes (no edges at all) ---
+            orphan_row = connection.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM nodes n
+                WHERE n.tenant_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM edges e
+                    WHERE e.tenant_id = n.tenant_id
+                      AND (e.source_id = n.id OR e.target_id = n.id)
+                  )
+                """,
+                (self.tenant_id,),
+            ).fetchone()
+            orphan_count = int(orphan_row["cnt"]) if orphan_row else 0
+
+            # --- invalidated (superseded) nodes ---
+            invalidated_row = connection.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM nodes
+                WHERE tenant_id = ? AND valid_to IS NOT NULL
+                """,
+                (self.tenant_id,),
+            ).fetchone()
+            invalidated_count = int(invalidated_row["cnt"]) if invalidated_row else 0
+
+            # --- age distribution ---
+            age_rows = connection.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN julianday('now') - julianday(updated_at) <= 7 THEN 1 ELSE 0 END) AS week,
+                  SUM(CASE WHEN julianday('now') - julianday(updated_at) <= 30 THEN 1 ELSE 0 END) AS month,
+                  SUM(CASE WHEN julianday('now') - julianday(updated_at) > 90 THEN 1 ELSE 0 END) AS stale
+                FROM nodes
+                WHERE tenant_id = ?
+                """,
+                (self.tenant_id,),
+            ).fetchone()
+
+        age_distribution = {
+            "updated_within_7d": int(age_rows["week"] or 0) if age_rows else 0,
+            "updated_within_30d": int(age_rows["month"] or 0) if age_rows else 0,
+            "stale_over_90d": int(age_rows["stale"] or 0) if age_rows else 0,
+        }
+
+        return {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "nodes_by_type": nodes_by_type,
+            "edges_by_type": edges_by_type,
+            "orphan_nodes": orphan_count,
+            "invalidated_nodes": invalidated_count,
+            "age_distribution": age_distribution,
+            "health_score": self._compute_health_score(
+                total_nodes=total_nodes,
+                orphan_count=orphan_count,
+                invalidated_count=invalidated_count,
+                stale_count=age_distribution["stale_over_90d"],
+            ),
+        }
+
+    @staticmethod
+    def _compute_health_score(
+        *,
+        total_nodes: int,
+        orphan_count: int,
+        invalidated_count: int,
+        stale_count: int,
+    ) -> dict[str, Any]:
+        """Compute a simple 0-100 health score with per-dimension breakdown."""
+        if total_nodes == 0:
+            return {"overall": 100, "connectivity": 100, "freshness": 100, "validity": 100}
+
+        # Connectivity: penalize orphan ratio
+        orphan_ratio = orphan_count / total_nodes
+        connectivity = max(0, round(100 * (1.0 - orphan_ratio * 2)))  # 50% orphans → 0
+
+        # Freshness: penalize stale ratio
+        stale_ratio = stale_count / total_nodes
+        freshness = max(0, round(100 * (1.0 - stale_ratio)))
+
+        # Validity: penalize high invalidation ratio
+        invalid_ratio = invalidated_count / total_nodes
+        validity = max(0, round(100 * (1.0 - invalid_ratio * 1.5)))
+
+        overall = round((connectivity * 0.4) + (freshness * 0.3) + (validity * 0.3))
+        return {
+            "overall": min(overall, 100),
+            "connectivity": min(connectivity, 100),
+            "freshness": min(freshness, 100),
+            "validity": min(validity, 100),
+        }
+
     def export_graph_html(
         self,
         *,

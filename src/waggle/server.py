@@ -164,6 +164,7 @@ REQUIRED_RUNTIME_METHODS = (
     "list_conflicts",
     "resolve_conflict",
     "edge_quality_report",
+    "graph_health",
 )
 
 # Mapping from legacy tool names to their canonical git-vocabulary equivalents.
@@ -1359,6 +1360,22 @@ class WaggleServer:
                     }
                 ),
             ),
+            types.Tool(
+                name="graph_health",
+                description=(
+                    "Return a structural health report for the memory graph. "
+                    "Includes node and edge counts by type, orphan node count, "
+                    "invalidated (superseded) node count, age distribution, and a "
+                    "composite 0-100 health score across connectivity, freshness, "
+                    "and validity dimensions. Use to decide if consolidation or "
+                    "pruning is needed."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        **_scope_properties(),
+                    }
+                ),
+            ),
             *(
                 [
                     types.Tool(
@@ -2193,6 +2210,27 @@ class WaggleServer:
                             f"  {rel}: count={stats['count']} avg_confidence={stats['avg_confidence']:.3f}"
                         )
                     result = self._tool_result("\n".join(lines), report)
+                elif name == "graph_health":
+                    health = graph.graph_health(
+                        agent_id=arguments.get("agent_id", ""),
+                        project=arguments.get("project", ""),
+                        session_id=arguments.get("session_id", ""),
+                    )
+                    score = health["health_score"]
+                    lines = [
+                        f"Graph health: {score['overall']}/100 "
+                        f"(connectivity={score['connectivity']}, freshness={score['freshness']}, validity={score['validity']})",
+                        f"Nodes: {health['total_nodes']}  Edges: {health['total_edges']}  Orphans: {health['orphan_nodes']}  Invalidated: {health['invalidated_nodes']}",
+                    ]
+                    for ntype, cnt in sorted(health.get("nodes_by_type", {}).items()):
+                        lines.append(f"  {ntype}: {cnt}")
+                    age = health.get("age_distribution", {})
+                    lines.append(
+                        f"Age: {age.get('updated_within_7d', 0)} <7d, "
+                        f"{age.get('updated_within_30d', 0)} <30d, "
+                        f"{age.get('stale_over_90d', 0)} >90d"
+                    )
+                    result = self._tool_result("\n".join(lines), health)
                 elif name == "build_context":
                     controller = RecursiveContextController(graph=graph)
                     ctx_result = controller.build_context(
