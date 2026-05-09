@@ -55,6 +55,8 @@ class AppConfig:
     # are merged at write time instead of creating a duplicate.
     # Must be >= 0.85 to avoid false-positive merges.
     dedup_threshold: float = 0.88
+    decay_enabled: bool = False
+    decay_half_life_days: float = 14.0
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -96,6 +98,8 @@ class AppConfig:
             tiered_retrieval=os.environ.get("WAGGLE_TIERED_RETRIEVAL", "false").strip().lower() == "true",
             tiered_retrieval_top_k_windows=int(os.environ.get("WAGGLE_TIERED_TOP_K_WINDOWS", "3")),
             dedup_threshold=float(os.environ.get("WAGGLE_DEDUP_THRESHOLD", "0.88")),
+            decay_enabled=os.environ.get("WAGGLE_DECAY_ENABLED", "false").strip().lower() == "true",
+            decay_half_life_days=float(os.environ.get("WAGGLE_DECAY_HALF_LIFE_DAYS", "14.0")),
         )
         config.validate()
         return config

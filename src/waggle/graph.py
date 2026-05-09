@@ -329,7 +329,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     valid_to TEXT DEFAULT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    access_count INTEGER DEFAULT 0
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS repos (
@@ -699,6 +700,8 @@ class MemoryGraph:
         tiered_retrieval_top_k_windows: int = 3,
         hybrid_retrieval_config: HybridRetrievalConfig | None = None,
         export_dir: str | Path | None = None,
+        decay_enabled: bool = False,
+        decay_half_life_days: float = 14.0,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.embedding_model = embedding_model
@@ -713,6 +716,8 @@ class MemoryGraph:
             recency_half_life_days=recency_half_life_days
         )
         self.export_dir = Path(export_dir).expanduser() if export_dir is not None else self.db_path.parent / "exports"
+        self.decay_enabled = decay_enabled
+        self.decay_half_life_days = decay_half_life_days
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
@@ -1359,6 +1364,8 @@ class MemoryGraph:
             connection.execute("ALTER TABLE nodes ADD COLUMN source_turn_pair_id TEXT DEFAULT ''")
         if "aliases" not in node_columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN aliases TEXT DEFAULT '[]'")
+        if "last_accessed_at" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN last_accessed_at TEXT DEFAULT NULL")
         if "tenant_id" not in edge_columns:
             connection.execute(
                 f"ALTER TABLE edges ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
@@ -7633,11 +7640,25 @@ class MemoryGraph:
                 half_life_days=self.recency_half_life_days,
                 superseded=self._node_is_superseded(node),
             ) + temporal_score_adjustment(node, temporal_hints) + negation_boost_by_id.get(node.id, 0.0)
-            
+
             if expansion_metadata is not None and node.id in expansion_metadata:
                 meta = expansion_metadata[node.id]
                 base += RELATION_SCORE_BOOST.get(meta.via_relation, 0.0)
-            
+
+            # Importance decay: multiplicative weight when decay is enabled.
+            # A node at full importance (1.0) is unaffected; a stale, isolated
+            # node gets pushed below fresh, well-connected ones.
+            if self.decay_enabled:
+                from waggle.memory_lifecycle import compute_importance
+                edge_count = degree_by_id.get(node.id, 0)
+                importance = compute_importance(
+                    node,
+                    half_life_days=self.decay_half_life_days,
+                    edge_count=edge_count,
+                )
+                node.importance_score = importance
+                base *= importance
+
             self._apply_node_score(node, similarity=similarity, edge_weight=edge_weight, now=now)
             node.final_score = base
             return base
@@ -8065,10 +8086,12 @@ class MemoryGraph:
         if not node_ids:
             return
         placeholders = ", ".join("?" for _ in node_ids)
+        # Always bump access_count; also stamp last_accessed_at for decay scoring.
         connection.execute(
             f"""
             UPDATE nodes
-            SET access_count = access_count + 1
+            SET access_count = access_count + 1,
+                last_accessed_at = datetime('now')
             WHERE tenant_id = ? AND id IN ({placeholders})
             """,
             (self.tenant_id, *node_ids),

@@ -74,6 +74,8 @@ class Node(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     access_count: int = 0
+    last_accessed_at: datetime | None = None
+    importance_score: float = 1.0
     similarity_score: float | None = None
     recency_score: float | None = None
     edge_score: float | None = None
