@@ -137,6 +137,7 @@ from waggle.models import (
 )
 from waggle.retrieval.hybrid import HybridRetrievalConfig, HybridRetriever
 from waggle.locks import ProcessLock
+from waggle.page_manager import GraphPageManager
 SCHEMA_VERSION = 7
 
 LOGGER = logging.getLogger(__name__)
@@ -699,6 +700,9 @@ class MemoryGraph:
         tiered_retrieval_top_k_windows: int = 3,
         hybrid_retrieval_config: HybridRetrievalConfig | None = None,
         export_dir: str | Path | None = None,
+        paging_enabled: bool = False,
+        page_size: int = 128,
+        paging_rebuild_threshold: int = 500,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.embedding_model = embedding_model
@@ -716,6 +720,20 @@ class MemoryGraph:
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+        # --- Spatial graph paging (MemPalace-inspired locality clustering) ---
+        self._paging_enabled: bool = paging_enabled
+        self._page_manager: GraphPageManager = GraphPageManager(
+            self.db_path.parent / "waggle.pages.json",
+            page_size=page_size,
+            rebuild_threshold=paging_rebuild_threshold,
+        )
+        if self._paging_enabled:
+            loaded = self._page_manager.load()
+            if not loaded:
+                LOGGER.info("paging_rebuild_triggered", extra={"db": str(self.db_path)})
+                with self._lock, self._connect() as connection:
+                    self._page_manager.rebuild_from_db(connection, self.tenant_id, self.embedding_model)
 
     def hybrid_retriever(self) -> HybridRetriever:
         return HybridRetriever(self, config=self.hybrid_retrieval_config)
@@ -2518,6 +2536,12 @@ class MemoryGraph:
                 },
                 connection=active_connection,
             )
+            # Incrementally assign the new node to the nearest page.
+            if self._paging_enabled and self._page_manager.is_built:
+                self._page_manager.assign_new_node(node.id, embedding_vector, node.project)
+                # Trigger a background-safe rebuild check (threshold logic inside).
+                if self._page_manager.rebuild_needed(len(self._page_manager._node_page) + self._page_manager._orphan_count):  # noqa: SLF001
+                    LOGGER.info("paging_rebuild_threshold_reached", extra={"orphans": self._page_manager._orphan_count})  # noqa: SLF001
             return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
         if connection is not None:
@@ -3003,15 +3027,37 @@ class MemoryGraph:
             if query.strip():
                 expanded_query = self._expand_query_aliases(query)
                 query_embedding = self.embedding_model.embed(expanded_query)
-                
-                scored_candidates = []
-                for node in candidates:
-                    similarity = 0.0
-                    emb = embeddings_by_id.get(node.id)
-                    if emb is not None:
-                        similarity = max(self.embedding_model.cosine_similarity(query_embedding, emb), 0.0)
-                    scored_candidates.append((similarity, node))
-                
+
+                # Page-centroid scoring: score P page centroids (P << N)
+                # to get a cheap locality signal, then apply as a per-node boost.
+                # When paging is disabled/not built, page_scores is {} and
+                # get_page_boost() returns 0.0 for every node — zero overhead.
+                page_scores = (
+                    self._page_manager.score_pages(query_embedding)
+                    if self._paging_enabled and self._page_manager.is_built
+                    else {}
+                )
+
+                # Batch vectorized similarity: one BLAS matmul instead of N Python calls.
+                node_ids_with_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is not None]
+                node_ids_no_emb = [n.id for n in candidates if embeddings_by_id.get(n.id) is None]
+                nodes_by_id_map = {n.id: n for n in candidates}
+
+                if node_ids_with_emb:
+                    emb_matrix = np.stack([embeddings_by_id[nid] for nid in node_ids_with_emb])
+                    scores = self.embedding_model.batch_cosine_similarity(query_embedding, emb_matrix)
+                    scored_candidates = [
+                        (
+                            float(s) + self._page_manager.get_page_boost(nid, page_scores),
+                            nodes_by_id_map[nid],
+                        )
+                        for nid, s in zip(node_ids_with_emb, scores)
+                    ]
+                else:
+                    scored_candidates = []
+                # Nodes without embeddings score 0 (no boost either)
+                scored_candidates.extend((0.0, nodes_by_id_map[nid]) for nid in node_ids_no_emb)
+
                 scored_candidates.sort(key=lambda item: item[0], reverse=True)
                 selected_nodes = [node for _, node in scored_candidates[:max_nodes]]
             else:

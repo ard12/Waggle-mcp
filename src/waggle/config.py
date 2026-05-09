@@ -35,6 +35,17 @@ class AppConfig:
     neo4j_username: str
     neo4j_password: str
     neo4j_database: str
+    hnsw_enabled: bool = False
+    # float32 (default) or float16 (halves memory, negligible recall loss)
+    hnsw_dtype: str = "float32"
+    # Spatial graph paging — MemPalace-inspired locality clustering.
+    # When enabled, nodes are clustered into pages; page-centroid similarity
+    # boosts individual node scores and expands candidate sets.
+    paging_enabled: bool = False
+    # Target nodes per page / cluster (default 128).
+    page_size: int = 128
+    # Trigger a page rebuild when orphan node count exceeds this value.
+    paging_rebuild_threshold: int = 500
     retention_enabled: bool = False
     retention_days: int = 90
     retention_prune_interval_hours: int = 24
@@ -64,6 +75,11 @@ class AppConfig:
         config = cls(
             backend=os.environ.get("WAGGLE_BACKEND", "sqlite").strip().lower(),
             transport=os.environ.get("WAGGLE_TRANSPORT", "stdio").strip().lower(),
+            hnsw_enabled=os.environ.get("WAGGLE_HNSW_ENABLED", "false").strip().lower() == "true",
+            hnsw_dtype=os.environ.get("WAGGLE_HNSW_DTYPE", "float32").strip().lower(),
+            paging_enabled=os.environ.get("WAGGLE_PAGING_ENABLED", "false").strip().lower() == "true",
+            page_size=int(os.environ.get("WAGGLE_PAGE_SIZE", "128")),
+            paging_rebuild_threshold=int(os.environ.get("WAGGLE_PAGING_REBUILD_THRESHOLD", "500")),
             model_name=os.environ.get("WAGGLE_MODEL", "all-MiniLM-L6-v2"),
             db_path=os.environ.get("WAGGLE_DB_PATH", DEFAULT_DB_PATH),
             default_tenant_id=os.environ.get("WAGGLE_DEFAULT_TENANT_ID", "local-default").strip(),

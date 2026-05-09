@@ -486,6 +486,9 @@ def _build_backend(config: AppConfig) -> Any:
             tiered_retrieval_top_k_windows=config.tiered_retrieval_top_k_windows,
             hybrid_retrieval_config=config.hybrid_retrieval_config(),
             export_dir=config.export_dir,
+            paging_enabled=config.paging_enabled,
+            page_size=config.page_size,
+            paging_rebuild_threshold=config.paging_rebuild_threshold,
         )
     from waggle.neo4j_graph import Neo4jMemoryGraph
 
