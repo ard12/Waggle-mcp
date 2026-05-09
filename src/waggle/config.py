@@ -55,6 +55,12 @@ class AppConfig:
     # are merged at write time instead of creating a duplicate.
     # Must be >= 0.85 to avoid false-positive merges.
     dedup_threshold: float = 0.88
+    # HNSW approximate nearest-neighbour index.
+    # Requires: pip install waggle-mcp[perf]  (hnswlib >= 0.8.0)
+    # When enabled, aggregate() uses O(log N) ANN search instead of O(N) scan.
+    hnsw_enabled: bool = False
+    # float32 (default) or float16 (halves memory, negligible recall loss)
+    hnsw_dtype: str = "float32"
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -96,6 +102,8 @@ class AppConfig:
             tiered_retrieval=os.environ.get("WAGGLE_TIERED_RETRIEVAL", "false").strip().lower() == "true",
             tiered_retrieval_top_k_windows=int(os.environ.get("WAGGLE_TIERED_TOP_K_WINDOWS", "3")),
             dedup_threshold=float(os.environ.get("WAGGLE_DEDUP_THRESHOLD", "0.88")),
+            hnsw_enabled=os.environ.get("WAGGLE_HNSW_ENABLED", "false").strip().lower() == "true",
+            hnsw_dtype=os.environ.get("WAGGLE_HNSW_DTYPE", "float32").strip().lower(),
         )
         config.validate()
         return config

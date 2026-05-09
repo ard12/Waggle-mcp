@@ -53,6 +53,13 @@ dev = [
   "pytest>=8.2.0",
   "pytest-asyncio>=0.23.7",
 ]
+perf = [
+  # Optional HNSW approximate nearest-neighbor index.
+  # When installed, query_graph / aggregate use O(log N) ANN search instead
+  # of O(N) brute-force scan.  Enable with WAGGLE_HNSW_ENABLED=true.
+  # Install: pip install waggle-mcp[perf]
+  "hnswlib>=0.8.0",
+]
 neo4j = [
   "neo4j>=5.20.0",
 ]

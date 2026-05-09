@@ -40,6 +40,7 @@ from waggle.abhi import (
 from waggle.auth import api_key_prefix, generate_api_key, hash_api_key, verify_api_key
 from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.embeddings import EmbeddingModel
+from waggle.hnsw_index import HNSWLIB_AVAILABLE, HNSWIndex
 from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
 from waggle.errors import AuthenticationError, ValidationFailure
 from waggle.intelligence import (
@@ -699,6 +700,8 @@ class MemoryGraph:
         tiered_retrieval_top_k_windows: int = 3,
         hybrid_retrieval_config: HybridRetrievalConfig | None = None,
         export_dir: str | Path | None = None,
+        hnsw_enabled: bool = False,
+        hnsw_dtype: str = "float32",
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.embedding_model = embedding_model
@@ -716,6 +719,23 @@ class MemoryGraph:
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+        # --- HNSW sidecar index ---
+        # Constructed unconditionally so the object is always present;
+        # HNSWIndex.is_available is False when hnswlib is not installed.
+        hnsw_path = self.db_path.with_suffix(".hnsw")
+        self._hnsw: HNSWIndex = HNSWIndex(
+            hnsw_path,
+            dim=self.embedding_model._embed_deterministically("probe").shape[0]  # warm dim probe  # noqa: SLF001
+            if self.embedding_model.uses_deterministic_mode
+            else 384,  # default; overridden on first add()
+            dtype=hnsw_dtype,
+        )
+        self._hnsw_enabled: bool = hnsw_enabled and HNSWLIB_AVAILABLE
+        if self._hnsw_enabled and self._hnsw.is_available and not hnsw_path.exists():
+            LOGGER.info("hnsw_rebuild_triggered", extra={"db": str(self.db_path)})
+            with self._lock, self._connect() as connection:
+                self._hnsw.rebuild_from_db(connection, self.tenant_id, self.embedding_model)
 
     def hybrid_retriever(self) -> HybridRetriever:
         return HybridRetriever(self, config=self.hybrid_retrieval_config)
@@ -2506,6 +2526,7 @@ class MemoryGraph:
             self._mark_window_embedding_stale(active_connection, resolved_context_window_id)
             self._update_window_node_count(active_connection, resolved_context_window_id)
             conflicts = self._register_conflicts(active_connection, node) if self.enable_dedup else []
+            # Emit audit event for new node.
             self.emit_audit_event(
                 event_type="graph.node.created",
                 resource_type="node",
@@ -2518,6 +2539,9 @@ class MemoryGraph:
                 },
                 connection=active_connection,
             )
+            # Keep HNSW index in sync with every SQLite write.
+            if self._hnsw_enabled:
+                self._hnsw.add(node.id, embedding_vector)
             return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
         if connection is not None:
@@ -2948,19 +2972,51 @@ class MemoryGraph:
             raise ValueError("max_depth cannot be negative.")
 
         with self._lock, self._connect() as connection:
-            node_rows = connection.execute(
-                """
-                SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags,
-                       source_prompt, metadata, evidence_records, valid_from, valid_to, created_at,
-                       updated_at, access_count, embedding, tenant_id
-                FROM nodes
-                WHERE tenant_id = ?
-                """,
-                (self.tenant_id,),
-            ).fetchall()
+            # When HNSW is enabled and a query string is provided, use the ANN
+            # index to retrieve candidate IDs in O(log N), then fetch only those
+            # rows from SQLite.  Falls back to full-scan when HNSW is off/unavailable.
+            if self._hnsw_enabled and self._hnsw.is_available and query.strip():
+                expanded_query_pre = self._expand_query_aliases(query)
+                query_embedding_pre = self.embedding_model.embed(expanded_query_pre)
+                hnsw_hits = self._hnsw.query(query_embedding_pre, k=max_nodes * 4)
+                if hnsw_hits:
+                    candidate_ids = tuple(nid for nid, _ in hnsw_hits)
+                    placeholders = ",".join("?" * len(candidate_ids))
+                    node_rows = connection.execute(
+                        f"""
+                        SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags,
+                               source_prompt, metadata, evidence_records, valid_from, valid_to, created_at,
+                               updated_at, access_count, embedding, tenant_id
+                        FROM nodes
+                        WHERE tenant_id = ? AND id IN ({placeholders})
+                        """,
+                        (self.tenant_id, *candidate_ids),
+                    ).fetchall()
+                    # Count total for stats (cheaper than full scan).
+                    total_row = connection.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE tenant_id = ?", (self.tenant_id,)
+                    ).fetchone()
+                    total_nodes_override = int(total_row[0]) if total_row else len(node_rows)
+                else:
+                    node_rows = []
+                    total_nodes_override = 0
+            else:
+                node_rows = connection.execute(
+                    """
+                    SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags,
+                           source_prompt, metadata, evidence_records, valid_from, valid_to, created_at,
+                           updated_at, access_count, embedding, tenant_id
+                    FROM nodes
+                    WHERE tenant_id = ?
+                    """,
+                    (self.tenant_id,),
+                ).fetchall()
+                total_nodes_override = None  # computed below
 
-            total_nodes = len(node_rows)
-            if total_nodes == 0:
+            total_nodes = total_nodes_override if total_nodes_override is not None else len(node_rows)
+            if total_nodes_override is None:
+                total_nodes = len(node_rows)
+            if len(node_rows) == 0 and (total_nodes_override is None or total_nodes_override == 0):
                 return SubgraphResult(query=query, total_nodes_in_graph=0)
 
             active_session_id = _retrieval_session_scope(
@@ -4013,6 +4069,10 @@ class MemoryGraph:
                     self.tenant_id,
                 ),
             )
+            # Keep HNSW in sync when embedding changed (content was updated).
+            if self._hnsw_enabled and content is not None:
+                embedding_vector_updated = self.embedding_model.from_bytes(embedding_bytes)
+                self._hnsw.add(updated_node.id, embedding_vector_updated)
             self.emit_audit_event(
                 event_type="graph.node.updated",
                 resource_type="node",
@@ -4109,6 +4169,9 @@ class MemoryGraph:
                 raise ValueError(f"Node not found: {node_id}")
             node = self._row_to_node(row)
             connection.execute("DELETE FROM nodes WHERE id = ? AND tenant_id = ?", (node_id, self.tenant_id))
+            # Keep HNSW in sync with the SQLite delete.
+            if self._hnsw_enabled:
+                self._hnsw.remove(node_id)
             self.emit_audit_event(
                 event_type="graph.node.deleted",
                 resource_type="node",
