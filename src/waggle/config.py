@@ -55,6 +55,13 @@ class AppConfig:
     # are merged at write time instead of creating a duplicate.
     # Must be >= 0.85 to avoid false-positive merges.
     dedup_threshold: float = 0.88
+    # Shared memory embedding cache.
+    # When enabled, node embeddings are stored in a mmap'd binary file
+    # (waggle.emb) for zero-copy cross-process reads; eliminates repeated
+    # SQLite BLOB deserialization in the aggregate() hot path.
+    emb_cache_enabled: bool = False
+    # float32 (default) or float16 (halves file size, negligible quality loss)
+    emb_cache_dtype: str = "float32"
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -96,6 +103,8 @@ class AppConfig:
             tiered_retrieval=os.environ.get("WAGGLE_TIERED_RETRIEVAL", "false").strip().lower() == "true",
             tiered_retrieval_top_k_windows=int(os.environ.get("WAGGLE_TIERED_TOP_K_WINDOWS", "3")),
             dedup_threshold=float(os.environ.get("WAGGLE_DEDUP_THRESHOLD", "0.88")),
+            emb_cache_enabled=os.environ.get("WAGGLE_EMB_CACHE_ENABLED", "false").strip().lower() == "true",
+            emb_cache_dtype=os.environ.get("WAGGLE_EMB_CACHE_DTYPE", "float32").strip().lower(),
         )
         config.validate()
         return config

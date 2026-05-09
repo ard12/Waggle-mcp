@@ -137,6 +137,7 @@ from waggle.models import (
 )
 from waggle.retrieval.hybrid import HybridRetrievalConfig, HybridRetriever
 from waggle.locks import ProcessLock
+from waggle.shared_container import EmbeddingCache
 SCHEMA_VERSION = 7
 
 LOGGER = logging.getLogger(__name__)
@@ -699,6 +700,8 @@ class MemoryGraph:
         tiered_retrieval_top_k_windows: int = 3,
         hybrid_retrieval_config: HybridRetrievalConfig | None = None,
         export_dir: str | Path | None = None,
+        emb_cache_enabled: bool = False,
+        emb_cache_dtype: str = "float32",
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.embedding_model = embedding_model
@@ -716,6 +719,22 @@ class MemoryGraph:
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+        # --- Shared-memory embedding cache ---
+        # Stores embeddings as a mmap'd flat binary file next to waggle.db.
+        # When populated, aggregate() reads embeddings from mmap (zero-copy)
+        # instead of deserialising SQLite BLOBs on every query.
+        self._emb_cache_enabled: bool = emb_cache_enabled
+        self._emb_cache: EmbeddingCache = EmbeddingCache(
+            self.db_path.parent / "waggle.emb",
+            dtype=emb_cache_dtype,
+        )
+        if self._emb_cache_enabled:
+            loaded = self._emb_cache.load()
+            if not loaded:
+                LOGGER.info("emb_cache_rebuild_triggered", extra={"db": str(self.db_path)})
+                with self._lock, self._connect() as connection:
+                    self._emb_cache.rebuild_from_db(connection, self.tenant_id, self.embedding_model)
 
     def hybrid_retriever(self) -> HybridRetriever:
         return HybridRetriever(self, config=self.hybrid_retrieval_config)
@@ -2518,6 +2537,9 @@ class MemoryGraph:
                 },
                 connection=active_connection,
             )
+            # Keep embedding cache in sync with every SQLite write.
+            if self._emb_cache_enabled and self._emb_cache.is_open:
+                self._emb_cache.put(node.id, embedding_vector)
             return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
         if connection is not None:
@@ -2986,7 +3008,12 @@ class MemoryGraph:
                         continue
                 candidates.append(node)
                 if row["embedding"] is not None:
-                    embeddings_by_id[node.id] = self.embedding_model.from_bytes(row["embedding"])
+                    # Prefer cache (zero-copy mmap view) over BLOB deserialisation.
+                    cached = self._emb_cache.get(node.id) if self._emb_cache_enabled else None
+                    embeddings_by_id[node.id] = (
+                        cached if cached is not None
+                        else self.embedding_model.from_bytes(row["embedding"])
+                    )
 
             # Apply temporal validity filtering
             candidates = _filter_valid_nodes(
@@ -4098,6 +4125,9 @@ class MemoryGraph:
                 raise ValueError(f"Node not found: {node_id}")
             node = self._row_to_node(row)
             connection.execute("DELETE FROM nodes WHERE id = ? AND tenant_id = ?", (node_id, self.tenant_id))
+            # Keep embedding cache in sync with the SQLite delete.
+            if self._emb_cache_enabled and self._emb_cache.is_open:
+                self._emb_cache.remove(node_id)
             self.emit_audit_event(
                 event_type="graph.node.deleted",
                 resource_type="node",
