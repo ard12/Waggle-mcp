@@ -176,11 +176,17 @@ class EmbeddingModel:
                 return np.frombuffer(self._embed_cache[normalized], dtype=np.float32).copy()
 
         if self.uses_deterministic_mode:
+            # Canonical deterministic path — always safe to cache.
             result = self._embed_deterministically(normalized)
+            should_cache = True
         else:
             model = self._resolve_model(wait_timeout)
             if model is None:
+                # Transient fallback: warmup timed-out or failed.
+                # Do NOT cache — once the model finishes loading, subsequent
+                # calls should get real embeddings, not stale deterministic ones.
                 result = self._embed_deterministically(normalized)
+                should_cache = False
             else:
                 result = np.asarray(
                     model.encode(
@@ -190,14 +196,19 @@ class EmbeddingModel:
                     ),
                     dtype=np.float32,
                 )
+                should_cache = True
 
-        # Store in cache (evict oldest entry when at capacity)
-        blob = result.tobytes()
-        with self._lock:
-            if normalized not in self._embed_cache:
-                if len(self._embed_cache) >= self._embed_cache_maxsize:
-                    self._embed_cache.popitem(last=False)
-                self._embed_cache[normalized] = blob
+        # Store in cache only when the result is canonical (not a transient fallback)
+        if should_cache:
+            blob = result.tobytes()
+            with self._lock:
+                if normalized in self._embed_cache:
+                    # Already written by a concurrent caller — just refresh LRU order
+                    self._embed_cache.move_to_end(normalized)
+                else:
+                    if len(self._embed_cache) >= self._embed_cache_maxsize:
+                        self._embed_cache.popitem(last=False)
+                    self._embed_cache[normalized] = blob
         return result
 
     def embed_batch(self, texts: list[str], *, wait_timeout: float = 30.0) -> np.ndarray:

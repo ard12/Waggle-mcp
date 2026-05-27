@@ -716,6 +716,7 @@ class _ReadWriteLock:
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.Lock())
         self._readers: int = 0
+        self._waiting_writers: int = 0         # queued writer count (starvation guard)
         self._write_owner: int | None = None   # threading.get_ident() of holder
         self._write_depth: int = 0             # re-entrancy depth
 
@@ -729,11 +730,15 @@ class _ReadWriteLock:
                 # Re-entrant acquire — same thread, just increment depth
                 self._write_depth += 1
                 return self
-            # Wait until no other writer and no readers
-            while self._write_owner is not None or self._readers > 0:
-                self._condition.wait()
-            self._write_owner = tid
-            self._write_depth = 1
+            # Track waiting writers so readers can yield to them
+            self._waiting_writers += 1
+            try:
+                while self._write_owner is not None or self._readers > 0:
+                    self._condition.wait()
+                self._write_owner = tid
+                self._write_depth = 1
+            finally:
+                self._waiting_writers -= 1
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -761,7 +766,9 @@ class _ReadWriteLock:
                     # write already implies exclusive access.
                     self._is_writer = True
                     return self
-                while self._rwl._write_owner is not None:
+                # Also yield to queued writers — prevents write starvation
+                # when read() paths become active on request threads.
+                while self._rwl._write_owner is not None or self._rwl._waiting_writers > 0:
                     self._rwl._condition.wait()
                 self._rwl._readers += 1
             return self
@@ -7939,9 +7946,14 @@ class MemoryGraph:
             for node in candidate_nodes
         ]
         scored_views.sort(key=lambda v: (-v.final_score, -v.updated_at_ts, v.label_lower))
-        # Rebuild the original Node order from the sorted view.
-        order = {v.node_id: i for i, v in enumerate(scored_views)}
-        return sorted(candidate_nodes, key=lambda n: order.get(n.id, len(scored_views)))
+        # O(n) reorder — scored_views is already sorted, just map back to Nodes.
+        # Avoids a redundant O(n log n) sorted() call on the original list.
+        nodes_by_id = {node.id: node for node in candidate_nodes}
+        reordered = [nodes_by_id[v.node_id] for v in scored_views if v.node_id in nodes_by_id]
+        # Preserve any candidates missing from scored_views (edge case safety)
+        scored_ids = {v.node_id for v in scored_views}
+        reordered += [n for n in candidate_nodes if n.id not in scored_ids]
+        return reordered
 
     def _add_clause_seed_ids(
         self,
