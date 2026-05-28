@@ -723,7 +723,7 @@ class _ReadWriteLock:
     # ------------------------------------------------------------------
     # Write lock — exclusive, re-entrant for the owning thread
     # ------------------------------------------------------------------
-    def __enter__(self) -> "_ReadWriteLock":
+    def __enter__(self) -> _ReadWriteLock:
         tid = threading.get_ident()
         with self._condition:
             if self._write_owner == tid:
@@ -752,13 +752,13 @@ class _ReadWriteLock:
     # Read lock — shared, blocks only when a *different* thread is writing
     # ------------------------------------------------------------------
     class _ReadContext:
-        __slots__ = ("_rwl", "_is_writer")
+        __slots__ = ("_is_writer", "_rwl")
 
-        def __init__(self, rwl: "_ReadWriteLock") -> None:
+        def __init__(self, rwl: _ReadWriteLock) -> None:
             self._rwl = rwl
             self._is_writer = False
 
-        def __enter__(self) -> "_ReadWriteLock._ReadContext":
+        def __enter__(self) -> _ReadWriteLock._ReadContext:
             tid = threading.get_ident()
             with self._rwl._condition:
                 if self._rwl._write_owner == tid:
@@ -781,7 +781,7 @@ class _ReadWriteLock:
                 if self._rwl._readers == 0:
                     self._rwl._condition.notify_all()
 
-    def read(self) -> "_ReadWriteLock._ReadContext":
+    def read(self) -> _ReadWriteLock._ReadContext:
         """Return a context manager that acquires a shared read lock."""
         return self._ReadContext(self)
 
@@ -795,10 +795,7 @@ class _ReadWriteLock:
 # The full Node object is preserved in candidate_nodes; ScoredNodeView is used
 # only as the sort key carrier within _sort_scored_nodes().
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass as _dataclass
-
-
-@_dataclass(slots=True)
+@dataclass(slots=True)
 class ScoredNodeView:
     """Minimal scored representation of a Node for the ranking hot path."""
 

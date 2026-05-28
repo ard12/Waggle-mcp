@@ -63,7 +63,7 @@ class EmbeddingModel:
         # --- embedding LRU cache ---
         # Keyed by normalised text; value is a pre-computed bytes blob so we
         # can return a fresh np.frombuffer view on each hit without re-encoding.
-        # 512 entries × 384 dims × 4 bytes ≈ 750 KB — negligible overhead.
+        # 512 entries x 384 dims x 4 bytes ~= 750 KB -- negligible overhead.
         self._embed_cache: OrderedDict[str, bytes] = OrderedDict()
         self._embed_cache_maxsize: int = 512
 
