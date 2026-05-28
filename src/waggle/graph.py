@@ -716,9 +716,9 @@ class _ReadWriteLock:
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.Lock())
         self._readers: int = 0
-        self._waiting_writers: int = 0         # queued writer count (starvation guard)
-        self._write_owner: int | None = None   # threading.get_ident() of holder
-        self._write_depth: int = 0             # re-entrancy depth
+        self._waiting_writers: int = 0  # queued writer count (starvation guard)
+        self._write_owner: int | None = None  # threading.get_ident() of holder
+        self._write_depth: int = 0  # re-entrancy depth
 
     # ------------------------------------------------------------------
     # Write lock — exclusive, re-entrant for the owning thread
@@ -800,10 +800,10 @@ class ScoredNodeView:
     """Minimal scored representation of a Node for the ranking hot path."""
 
     node_id: str
-    updated_at_ts: float       # pre-converted .timestamp() — avoids per-compare call
+    updated_at_ts: float  # pre-converted .timestamp() — avoids per-compare call
     access_count: int
     final_score: float = 0.0
-    label_lower: str = ""      # pre-lowercased for tiebreak sort
+    label_lower: str = ""  # pre-lowercased for tiebreak sort
 
 
 class MemoryGraph:
@@ -6666,8 +6666,7 @@ class MemoryGraph:
             existing_embedding = self.embedding_model.from_bytes(row["embedding"])
             # Use fast dot() — caller pre-normalises `embedding` before the loop
             # so np.dot(normed_a, normed_b) == cosine_similarity(a, b).
-            similarity = float(np.dot(embedding, existing_embedding /
-                (np.linalg.norm(existing_embedding) or 1.0)))
+            similarity = float(np.dot(embedding, existing_embedding / (np.linalg.norm(existing_embedding) or 1.0)))
             label_score = label_similarity(node.label, existing_node.label)
             acronym_match = is_acronym_match(node.label, existing_node.label)
 
