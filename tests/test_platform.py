@@ -393,6 +393,21 @@ def test_mcp_write_requires_graph_write_scope(tmp_path: Path) -> None:
         assert denied.status_code == 403
 
 
+def test_http_graph_delete_edge_requires_graph_write_scope(tmp_path: Path) -> None:
+    """Regression test for #46: graph_delete_edge mutates the graph and must require graph:write."""
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    read_only_key = graph.create_api_key("tenant-http", "reader", scopes=["graph:read"])
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        denied = client.delete(
+            "/api/graph/edges/any-edge-id",
+            headers={"X-API-Key": read_only_key.raw_api_key},
+        )
+        assert denied.status_code == 403
+
+
 def test_http_graph_editor_routes_and_crud(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
     insert_transcript_record(

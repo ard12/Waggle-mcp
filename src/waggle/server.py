@@ -3505,7 +3505,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_delete_edge(request: Request) -> Response:
         edge_id = request.path_params["edge_id"]
-        graph, _ = _require_http_scope(request, "graph:read")
+        graph, _ = _require_http_scope(request, "graph:write")
         edge = graph.delete_edge(edge_id=edge_id)
         return JSONResponse(edge.model_dump(mode="json"))
 
